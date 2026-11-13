@@ -1,0 +1,87 @@
+name: Package Windows x64
+
+# Produces the Windows distributables only: the portable ZIP and the Inno Setup
+# EXE built from it. Desktop packages does the same work but builds all three
+# platforms and runs the whole suite first.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    env:
+      WORKBUDDY_PROXY_CATALOG_TEST_URL: http://127.0.0.1:1/catalog
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            gpui -> target
+      - name: Resolve package version
+        shell: bash
+        run: echo "PACKAGE_VERSION=$(python scripts/release_version.py)" >> "$GITHUB_ENV"
+      - name: Verify the runner is x64
+        shell: pwsh
+        run: |
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          Write-Output "PROCESSOR_ARCHITECTURE=$arch"
+          if ($arch -ne 'AMD64') { throw "windows-latest is not an x64 runner: $arch" }
+      - name: Build Core
+        run: cargo build --release --locked
+      - name: Build GPUI
+        run: cargo build --manifest-path gpui/Cargo.toml --release --locked
+      - name: Verify both binaries are x64
+        run: python scripts/pe_arch.py --expect x64 target/release/workbuddy-proxy.exe gpui/target/release/workbuddy-proxy-gpui.exe
+      - name: Smoke the Core
+        run: python scripts/smoke.py --exe target/release/workbuddy-proxy.exe
+      - name: Package the portable ZIP
+        run: python scripts/package.py --exe target/release/workbuddy-proxy.exe --gpui gpui/target/release/workbuddy-proxy-gpui.exe --platform windows-x64
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (!(Test-Path $iscc)) {
+            choco install innosetup --yes --no-progress --limit-output
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+          }
+          if ((Get-Item $iscc).VersionInfo.FileVersionRaw -lt [version]'6.5.0') {
+            choco upgrade innosetup --yes --no-progress --limit-output
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup 6.5+ upgrade failed' }
+          }
+          Write-Output ((Get-Item $iscc).VersionInfo.FileVersion)
+      - name: Compile the EXE installer
+        run: python scripts/windows_installer.py --zip "dist/workbuddy-proxy-${{ env.PACKAGE_VERSION }}-windows-x64.zip"
+      - name: Verify the installer is an x64 executable
+        run: python scripts/pe_arch.py --expect x64 "dist/workbuddy-proxy-${{ env.PACKAGE_VERSION }}-windows-x64-setup.exe"
+      - name: Test the installer against the ZIP it was built from
+        run: python scripts/windows_installer_test.py --setup "dist/workbuddy-proxy-${{ env.PACKAGE_VERSION }}-windows-x64-setup.exe" --zip "dist/workbuddy-proxy-${{ env.PACKAGE_VERSION }}-windows-x64.zip" --output "installer-report.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy-proxy-windows-x64
+          path: |
+            dist/*windows-x64.zip
+            dist/*windows-x64.zip.sha256
+            dist/*windows-x64-setup.exe
+            dist/*setup.exe.sha256
+            installer-report.json
+          if-no-files-found: error
+      - name: Summarize
+        shell: bash
+        run: |
+          {
+            echo "### workbuddy-proxy ${PACKAGE_VERSION} for Windows x64"
+            echo
+            ls -lh dist/
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
