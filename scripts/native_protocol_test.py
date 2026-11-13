@@ -387,11 +387,12 @@ def main():
                         else:
                             assert status == 200 and b'"error"' in raw and b'[DONE]' not in raw and b'"finish_reason":"stop"' not in raw
                         assert SECRET.encode() not in raw and KEY.encode() not in raw
-                    before = server.seen_posts
-                    status, raw, _ = error_request(port, 'wbp-native-%s' % i, base, extra={'seed': 0})
                     # A field the native protocols cannot express is dropped, not
-                    # rejected: the turn must still reach the model.
+                    # rejected: the turn still reaches the model.
+                    base[2]['content'][0]['text'] = 'hello'
+                    status, raw, _ = error_request(port, 'wbp-native-%s' % i, base, extra={'seed': 0})
                     assert status == 200 and SECRET.encode() not in raw and KEY.encode() not in raw
+                    before = server.seen_posts
                     status, raw, _ = error_request(port, 'wbp-native-%s' % i, base, query='?unsupported=1')
                     assert status == 400 and json.loads(raw)['error']['code'] == 'unsupported_query'
                     expired = [{'role': 'user', 'content': 'hello'}, {'role': 'assistant', 'content': None, 'tool_calls': [
