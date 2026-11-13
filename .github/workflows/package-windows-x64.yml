@@ -59,8 +59,9 @@ jobs:
           Write-Output ((Get-Item $iscc).VersionInfo.FileVersion)
       - name: Compile the EXE installer
         run: python scripts/windows_installer.py --zip "dist/workbuddy-proxy-${{ env.PACKAGE_VERSION }}-windows-x64.zip"
-      - name: Verify the installer is an x64 executable
-        run: python scripts/pe_arch.py --expect x64 "dist/workbuddy-proxy-${{ env.PACKAGE_VERSION }}-windows-x64-setup.exe"
+      # The setup stub is always 32-bit: Inno Setup compiles a x86 bootstrap and
+      # ArchitecturesAllowed only restricts which systems may install. What has
+      # to hold is that it installs the x64 payload, which the next step proves.
       - name: Test the installer against the ZIP it was built from
         run: python scripts/windows_installer_test.py --setup "dist/workbuddy-proxy-${{ env.PACKAGE_VERSION }}-windows-x64-setup.exe" --zip "dist/workbuddy-proxy-${{ env.PACKAGE_VERSION }}-windows-x64.zip" --output "installer-report.json"
       - uses: actions/upload-artifact@v4
