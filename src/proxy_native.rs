@@ -72,39 +72,24 @@ fn prepare(b: &Bridge, r: &Route, bytes: &[u8]) -> Result<Prepared, Error> {
     if !caps.supports_tool_call && !request.tools.is_empty() {
         return Err(Error::input("model_does_not_support_tools", "tools"));
     }
-    if caps.only_reasoning && request.reasoning_effort.as_deref() == Some("none") {
-        return Err(Error::input("model_requires_reasoning", "reasoning_effort"));
-    }
-    if resolved.reasoning_known
-        && request
-            .reasoning_effort
-            .as_deref()
-            .is_some_and(|e| e != "none")
-        && !caps.supports_reasoning
-    {
-        return Err(Error::input(
-            "model_does_not_support_reasoning",
-            "reasoning_effort",
-        ));
-    }
-    if resolved.reasoning_known
-        && request.reasoning_effort.as_deref().is_some_and(|e| {
-            e != "none" && !caps.reasoning.supported_efforts.iter().any(|v| v == e)
-        })
-    {
-        return Err(Error::input(
-            "unsupported_model_reasoning_effort",
-            "reasoning_effort",
-        ));
-    }
-    if resolved.reasoning_known
-        && request.reasoning_effort.as_deref() == Some("none")
-        && !caps.reasoning.can_disable_thinking
-    {
-        return Err(Error::input(
-            "model_cannot_disable_reasoning",
-            "reasoning_effort",
-        ));
+    // Reasoning effort is a preference, not a request that can be honoured
+    // exactly. A model that always thinks cannot be told to stop; one that
+    // never thinks cannot be told to start; an effort tier the model does not
+    // offer has no exact translation. In all four cases dropping the hint costs
+    // at most some tokens, while rejecting the turn costs the whole exchange.
+    if let Some(effort) = request.reasoning_effort.as_deref() {
+        let wants_none = effort == "none";
+        let supported = caps.reasoning.supported_efforts.iter().any(|v| v == effort);
+        let unusable = if wants_none {
+            caps.only_reasoning
+                || (resolved.reasoning_known && !caps.reasoning.can_disable_thinking)
+        } else {
+            resolved.reasoning_known && (!caps.supports_reasoning || !supported)
+        };
+        if unusable {
+            protocol::request::note_ignored("request", "reasoning_effort");
+            request.reasoning_effort = None;
+        }
     }
     if let Some(cap) = caps.max_output_tokens {
         if request.max_output_tokens.is_some_and(|n| n > cap) {
@@ -271,6 +256,24 @@ fn note_rejection(e: &Error) {
         let _ = file.write_all(line.as_bytes());
     }
 }
+/// Keeps the last request that failed validation, so an offending field can be
+/// read instead of inferred: the response carries only a structural path such
+/// as messages[0].content[0], which names the block but not what was wrong with
+/// it. Only the most recent rejection is kept, and it stays on this machine.
+fn dump_rejected(e: &Error, body: &[u8]) {
+    if e.status != 400 {
+        return;
+    }
+    let dir = std::env::temp_dir();
+    let meta = format!(
+        "code={} param={} bytes={}\n",
+        e.code,
+        e.param.as_deref().unwrap_or("-"),
+        body.len()
+    );
+    let _ = std::fs::write(dir.join("workbuddy-proxy-rejected-body.meta"), meta);
+    let _ = std::fs::write(dir.join("workbuddy-proxy-rejected-body.json"), body);
+}
 fn failure(e: Error, headers: HeaderMap) -> Response<Body> {
     note_rejection(&e);
     let mut response = Response::builder()
@@ -380,6 +383,7 @@ pub(super) async fn relay(
         Ok(p) => p,
         Err(e) => {
             reject(&mut guard, &e, ErrorKind::Other);
+            dump_rejected(&e, &bytes);
             return failure(e, HeaderMap::new());
         }
     };

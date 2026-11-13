@@ -325,9 +325,13 @@ fn anthropic(
             }
             json!(parts)
         };
-        messages.push(
-            json!({"role":if m.role==Role::Assistant {"assistant"}else{"user"},"content":content}),
-        );
+        // Anthropic rejects an empty content array. A message whose blocks were
+        // all dropped is skipped rather than sent as an empty turn.
+        if replay.is_some() || !content.as_array().is_some_and(Vec::is_empty) {
+            messages.push(
+                json!({"role":if m.role==Role::Assistant {"assistant"}else{"user"},"content":content}),
+            );
+        }
         remember(&mut calls, m, replay);
         call_order = m.calls.iter().map(|c| c.id.clone()).collect();
         i += 1;

@@ -178,7 +178,7 @@ fn object<'a>(v: &'a Value, path: &str) -> Result<&'a Map<String, Value>, Error>
 }
 /// Records the first occurrence of each dropped key. This is a diagnostic aid
 /// only, so every step degrades silently rather than failing a request.
-fn note_ignored(path: &str, key: &str) {
+pub(crate) fn note_ignored(path: &str, key: &str) {
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     let Ok(mut seen) = seen.lock() else {
@@ -538,42 +538,86 @@ fn parse_message(v: &Value, i: usize) -> Result<Message, Error> {
         Some(Value::Array(items)) => {
             for (j, item) in items.iter().enumerate() {
                 let path = format!("{path}.content[{j}]");
-                let m = object(item, &path)?;
-                match string(m.get("type"), &path)? {
-                    "text" => {
-                        keys(m, &["type", "text"], &path)?;
-                        parts.push(Part::Text(string(m.get("text"), &path)?.into()));
+                // Every block below degrades: a part the native protocols
+                // cannot carry is dropped, because one unrecognised block (a
+                // provider hint, a media kind, a bare string) must not cost
+                // the whole exchange. What survives is still a valid turn, and
+                // the encoder skips a message that loses all of its parts.
+                let Some(m) = item.as_object() else {
+                    match item.as_str() {
+                        Some(text) => {
+                            note_ignored(&path, "string-part");
+                            parts.push(Part::Text(text.into()));
+                        }
+                        None => note_ignored(&path, "non-object-part"),
                     }
-                    "image_url" if role == Role::User => {
-                        keys(m, &["type", "image_url"], &path)?;
-                        let image = object(m.get("image_url").unwrap_or(&Value::Null), &path)?;
-                        keys(image, &["url", "detail"], &path)?;
-                        let detail = image
-                            .get("detail")
-                            .map(|v| string(Some(v), &path))
-                            .transpose()?
-                            .unwrap_or("auto");
+                    continue;
+                };
+                let kind = match m.get("type").and_then(Value::as_str) {
+                    Some(kind) => kind,
+                    None => {
+                        // Several clients omit the tag on a plain text block.
+                        note_ignored(&path, "missing-type");
+                        match m.get("text").and_then(Value::as_str) {
+                            Some(_) => "text",
+                            None => {
+                                note_ignored(&path, "typeless-part");
+                                continue;
+                            }
+                        }
+                    }
+                };
+                match kind {
+                    "text" | "input_text" | "output_text" | "text_delta" => {
+                        match m.get("text").and_then(Value::as_str) {
+                            Some(text) => parts.push(Part::Text(text.into())),
+                            None => note_ignored(&path, "text"),
+                        }
+                    }
+                    "image_url" | "input_image" => {
+                        // Only user turns can carry images upstream; for any
+                        // other role the block is dropped rather than fatal.
+                        if role != Role::User {
+                            note_ignored(&path, "image-outside-user-role");
+                            continue;
+                        }
+                        // image_url is an object {"url","detail"} in Chat
+                        // Completions and a bare string in Responses.
+                        let container = m.get("image_url").and_then(Value::as_object);
+                        let url = match m.get("image_url") {
+                            Some(Value::String(url)) => Some(url.as_str()),
+                            _ => container
+                                .and_then(|c| c.get("url"))
+                                .and_then(Value::as_str),
+                        };
+                        let Some(url) = url else {
+                            note_ignored(&path, "image-url");
+                            continue;
+                        };
                         // Detail is a hint; an unrecognised value ("original",
-                        // "high_res", ...) falls back to auto instead of
-                        // invalidating the whole message.
+                        // "high_res", ...) falls back to auto.
+                        let detail = container
+                            .and_then(|c| c.get("detail"))
+                            .and_then(Value::as_str)
+                            .or_else(|| m.get("detail").and_then(Value::as_str))
+                            .unwrap_or("auto");
                         let detail = if matches!(detail, "auto" | "low" | "high") {
                             detail
                         } else {
                             note_ignored(&path, "image_url.detail");
                             "auto"
                         };
-                        parts.push(parse_image(
-                            string(image.get("url"), &path)?,
-                            detail,
-                            &path,
-                        )?);
+                        match parse_image(url, detail, &path) {
+                            Ok(part) => parts.push(part),
+                            Err(_) => note_ignored(&path, "undecodable-image"),
+                        }
                     }
-                    _ => return Err(Error::input("unsupported_content", path)),
+                    other => note_ignored(&path, other),
                 }
             }
         }
-        None | Some(Value::Null) if role == Role::Assistant && m.contains_key("tool_calls") => (),
-        _ => return Err(Error::input("invalid_content", format!("{path}.content"))),
+        None | Some(Value::Null) => note_ignored(&path, "empty-content"),
+        Some(_) => note_ignored(&path, "non-string-content"),
     }
     let calls = if let Some(calls) = m.get("tool_calls") {
         if role != Role::Assistant {
@@ -835,13 +879,34 @@ mod tests {
                 "{extra}"
             );
         }
-        // Dropping keys must not weaken content typing.
-        assert!(
-            ChatRequest::parse(
-                br#"{"model":"a","messages":[{"role":"user","content":[{"type":"audio"}]}]}"#
-            )
-            .is_err()
-        );
+        // An unrecognised block is dropped instead of ending the turn: the
+        // remaining blocks still carry the message.
+        let request = ChatRequest::parse(
+            br#"{"model":"a","messages":[{"role":"user","content":[{"type":"audio"},{"type":"text","text":"ok"},{"type":"input_text","text":"and"},{"type":"document","source":{}}]}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(&request.messages[0].parts[..], [Part::Text(a), Part::Text(b)] if a == "ok" && b == "and"));
+        // A block with no type tag is inferred from its shape.
+        let request =
+            ChatRequest::parse(br#"{"model":"a","messages":[{"role":"user","content":[{"text":"hi"}]}]}"#)
+                .unwrap();
+        assert!(matches!(&request.messages[0].parts[..], [Part::Text(t)] if t == "hi"));
+        // Content that carries nothing at all leaves the message empty rather
+        // than failing the request; encoders skip it.
+        for body in [
+            br#"{"model":"a","messages":[{"role":"user","content":null}]}"#.as_slice(),
+            br#"{"model":"a","messages":[{"role":"user","content":[]}]}"#.as_slice(),
+            br#"{"model":"a","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"ftp://x/y.png"}}]}]}"#.as_slice(),
+        ] {
+            let request = ChatRequest::parse(body).unwrap();
+            assert!(request.messages[0].parts.is_empty());
+        }
+        // An image outside a user turn cannot be represented, so it is dropped.
+        let request = ChatRequest::parse(
+            br#"{"model":"a","messages":[{"role":"system","content":[{"type":"image_url","image_url":{"url":"https://x/y.png"}},{"type":"text","text":"sys"}]}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(&request.messages[0].parts[..], [Part::Text(t)] if t == "sys"));
     }
     #[test]
     fn same_name_parallel_calls_reordered_results_and_continuous_rounds_are_valid() {
