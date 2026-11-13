@@ -3,8 +3,9 @@ use super::Error;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
+    sync::{Mutex, OnceLock},
 };
 
 pub const INPUT_LIMIT: usize = 8 * 1024 * 1024;
@@ -172,42 +173,36 @@ fn object<'a>(v: &'a Value, path: &str) -> Result<&'a Map<String, Value>, Error>
     v.as_object()
         .ok_or_else(|| Error::input("invalid_parameter", path))
 }
-fn keys(m: &Map<String, Value>, allowed: &[&str], path: &str) -> Result<(), Error> {
-    if m.keys().any(|k| !allowed.contains(&k.as_str())) {
-        return Err(Error::input("unsupported_parameter", path));
+/// Records the first occurrence of each dropped key. This is a diagnostic aid
+/// only, so every step degrades silently rather than failing a request.
+fn note_ignored(path: &str, key: &str) {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return;
+    };
+    if !seen.insert(key.to_owned()) {
+        return;
     }
-    Ok(())
+    let file = std::env::temp_dir().join("workbuddy-proxy-ignored-keys.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)
+    {
+        let _ = std::io::Write::write_all(&mut file, format!("{path}.{key}\n").as_bytes());
+    }
 }
 
-/// OpenAI-compatible clients routinely attach fields that the native upstream
-/// protocols have no representation for. These are dropped instead of failing
-/// the request: a harmless extra key must not break an otherwise valid turn.
-const IGNORED_REQUEST_KEYS: &[&str] = &[
-    "n",
-    "store",
-    "metadata",
-    "user",
-    "seed",
-    "logprobs",
-    "top_logprobs",
-    "frequency_penalty",
-    "presence_penalty",
-    "service_tier",
-    "prediction",
-    "modalities",
-    "audio",
-    "verbosity",
-    "safety_identifier",
-    "prompt_cache_key",
-    "web_search_options",
-    "reasoning",
-];
-
-fn keys_may_ignore(m: &Map<String, Value>, allowed: &[&str], path: &str) -> Result<(), Error> {
-    if m.keys().any(|k| {
-        !allowed.contains(&k.as_str()) && !IGNORED_REQUEST_KEYS.contains(&k.as_str())
-    }) {
-        return Err(Error::input("unsupported_parameter", path));
+/// Chat clients routinely attach fields the native upstream protocols cannot
+/// express: annotations, provider hints, trace ids, caching directives. Only the
+/// fields this layer actually translates have to be well formed, so anything
+/// else is dropped instead of ending an otherwise valid turn.
+fn keys(m: &Map<String, Value>, allowed: &[&str], path: &str) -> Result<(), Error> {
+    for key in m.keys() {
+        if !allowed.contains(&key.as_str()) {
+            note_ignored(path, key);
+        }
     }
     Ok(())
 }
@@ -253,7 +248,7 @@ impl ChatRequest {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let value = strict_json(bytes, INPUT_LIMIT)?;
         let m = object(&value, "request")?;
-        keys_may_ignore(
+        keys(
             m,
             &[
                 "model",
@@ -757,8 +752,39 @@ mod tests {
                 .max_output_tokens,
             Some(12)
         );
-        let error = parse(json!({"credential-value-as-key":"credential-value"})).unwrap_err();
+        // Unknown keys are dropped, but a payload value must never be echoed
+        // back in an error envelope.
+        assert!(parse(json!({"credential-value-as-key":"credential-value"})).is_ok());
+        let error = parse(json!({"messages":[{"role":12345,"content":"credential-value"}]}))
+            .unwrap_err();
         assert!(!error.envelope().to_string().contains("credential"));
+    }
+    #[test]
+    fn unknown_keys_inside_messages_are_dropped() {
+        for extra in [
+            json!({"reasoning_content":"thinking"}),
+            json!({"annotations":[]}),
+            json!({"refusal":null}),
+            json!({"cache_control":{"type":"ephemeral"}}),
+            json!({"provider_metadata":{"trace":"t"}}),
+        ] {
+            let mut message = json!({"role":"assistant","content":"hello"});
+            for (k, v) in extra.as_object().unwrap() {
+                message[k] = v.clone();
+            }
+            let request = json!({"model":"local-alias","messages":[message]});
+            assert!(
+                ChatRequest::parse(&serde_json::to_vec(&request).unwrap()).is_ok(),
+                "{extra}"
+            );
+        }
+        // Dropping keys must not weaken content typing.
+        assert!(
+            ChatRequest::parse(
+                br#"{"model":"a","messages":[{"role":"user","content":[{"type":"audio"}]}]}"#
+            )
+            .is_err()
+        );
     }
     #[test]
     fn same_name_parallel_calls_reordered_results_and_continuous_rounds_are_valid() {
