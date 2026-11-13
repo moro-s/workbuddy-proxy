@@ -37,15 +37,25 @@ impl Error {
     }
 
     pub fn envelope(&self) -> serde_json::Value {
+        // The distinct code travels in the human-readable message too. Otherwise
+        // every stream-level failure looks identical to the user ("invalid or
+        // incomplete"), and the one detail that identifies the cause - which
+        // event or item was rejected - stays buried in the proxy's internals.
+        let message = match self.status {
+            _ if self.code == "upstream_http_error" => "Upstream rejected the request".to_string(),
+            _ if self.code == "upstream_connection_error" => {
+                "Upstream connection failed".to_string()
+            }
+            _ if self.code == "upstream_timeout" => "Upstream response timed out".to_string(),
+            409 => "Conversation state expired; start a new conversation".to_string(),
+            400 => "Request cannot be represented by the selected upstream protocol".to_string(),
+            _ => format!(
+                "Upstream protocol response was invalid or incomplete ({})",
+                self.code
+            ),
+        };
         serde_json::json!({"error":{
-            "message": match self.status {
-                _ if self.code=="upstream_http_error"=>"Upstream rejected the request",
-                _ if self.code=="upstream_connection_error"=>"Upstream connection failed",
-                _ if self.code=="upstream_timeout"=>"Upstream response timed out",
-                409 => "Conversation state expired; start a new conversation",
-                400 => "Request cannot be represented by the selected upstream protocol",
-                _ => "Upstream protocol response was invalid or incomplete",
-            },
+            "message": message,
             "type": if self.status == 400 && self.param.is_some() { "invalid_request_error" } else { "upstream_error" },
             "param":self.param,"code":self.code
         }})

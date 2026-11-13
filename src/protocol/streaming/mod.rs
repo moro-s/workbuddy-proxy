@@ -508,6 +508,9 @@ mod tests {
             json!({"type":"response.content_part.added","output_index":0,"item_id":"msg","content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}),
             json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg","content_index":0,"delta":"你"}),
             json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg","content_index":0,"delta":"好"}),
+            // Real upstream order: moderation metadata arrives right after the
+            // last delta and before the .done events.
+            json!({"type":"response.metadata","response_id":"resp","metadata":{"openai_chatgpt_moderation_metadata":{"prompt":{},"generation":{}}}}),
             json!({"type":"response.output_text.done","output_index":0,"item_id":"msg","content_index":0,"text":"你好"}),
             json!({"type":"response.content_part.done","output_index":0,"item_id":"msg","content_index":0,"part":{"type":"output_text","text":"你好","annotations":[]}}),
             json!({"type":"response.output_item.done","output_index":0,"item":message}),

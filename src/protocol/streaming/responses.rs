@@ -279,6 +279,12 @@ impl State {
             "response.output_text.annotation.added" => {
                 self.item(&v, "message")?;
             }
+            // Provider-side moderation and telemetry. Carries no text or tool
+            // output and references no output item, so there is nothing to
+            // reconcile. Every streamed response from this upstream emits one
+            // between the last delta and response.completed; rejecting it tore
+            // down the whole stream after the text had already been delivered.
+            "response.metadata" => {}
             _ => return Err(bad("unsupported_upstream_event")),
         }
         Ok(())
