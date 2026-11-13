@@ -11,7 +11,10 @@ permissions:
 
 jobs:
   dmg:
-    runs-on: macos-14
+    # macos-14 is not offered to this repository ("configuration
+    # macos-14-arm64-us-default is not supported") and the job is cancelled
+    # before it starts, so use the alias and assert the architecture instead.
+    runs-on: macos-latest
     env:
       WORKBUDDY_PROXY_CATALOG_TEST_URL: http://127.0.0.1:1/catalog
     steps:
@@ -28,6 +31,11 @@ jobs:
       - name: Resolve package version
         shell: bash
         run: echo "PACKAGE_VERSION=$(python scripts/release_version.py)" >> "$GITHUB_ENV"
+      - name: Verify the runner is arm64
+        shell: bash
+        run: |
+          uname -m
+          [ "$(uname -m)" = "arm64" ] || { echo '::error::macos-latest was not an arm64 runner'; exit 1; }
       - name: Build Core
         run: cargo build --release --locked
       - name: Build GPUI
