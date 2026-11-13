@@ -586,9 +586,7 @@ fn parse_message(v: &Value, i: usize) -> Result<Message, Error> {
                         let container = m.get("image_url").and_then(Value::as_object);
                         let url = match m.get("image_url") {
                             Some(Value::String(url)) => Some(url.as_str()),
-                            _ => container
-                                .and_then(|c| c.get("url"))
-                                .and_then(Value::as_str),
+                            _ => container.and_then(|c| c.get("url")).and_then(Value::as_str),
                         };
                         let Some(url) = url else {
                             note_ignored(&path, "image-url");
@@ -856,8 +854,8 @@ mod tests {
         // Unknown keys are dropped, but a payload value must never be echoed
         // back in an error envelope.
         assert!(parse(json!({"credential-value-as-key":"credential-value"})).is_ok());
-        let error = parse(json!({"messages":[{"role":12345,"content":"credential-value"}]}))
-            .unwrap_err();
+        let error =
+            parse(json!({"messages":[{"role":12345,"content":"credential-value"}]})).unwrap_err();
         assert!(!error.envelope().to_string().contains("credential"));
     }
     #[test]
@@ -885,11 +883,14 @@ mod tests {
             br#"{"model":"a","messages":[{"role":"user","content":[{"type":"audio"},{"type":"text","text":"ok"},{"type":"input_text","text":"and"},{"type":"document","source":{}}]}]}"#,
         )
         .unwrap();
-        assert!(matches!(&request.messages[0].parts[..], [Part::Text(a), Part::Text(b)] if a == "ok" && b == "and"));
+        assert!(
+            matches!(&request.messages[0].parts[..], [Part::Text(a), Part::Text(b)] if a == "ok" && b == "and")
+        );
         // A block with no type tag is inferred from its shape.
-        let request =
-            ChatRequest::parse(br#"{"model":"a","messages":[{"role":"user","content":[{"text":"hi"}]}]}"#)
-                .unwrap();
+        let request = ChatRequest::parse(
+            br#"{"model":"a","messages":[{"role":"user","content":[{"text":"hi"}]}]}"#,
+        )
+        .unwrap();
         assert!(matches!(&request.messages[0].parts[..], [Part::Text(t)] if t == "hi"));
         // Content that carries nothing at all leaves the message empty rather
         // than failing the request; encoders skip it.
@@ -969,7 +970,10 @@ mod tests {
 
         // Stop lists are truncated, and unusable forms become empty.
         assert_eq!(
-            parse(json!({"stop":["a","b","c","d","e"]})).unwrap().stop.len(),
+            parse(json!({"stop":["a","b","c","d","e"]}))
+                .unwrap()
+                .stop
+                .len(),
             4
         );
         assert!(parse(json!({"stop":42})).unwrap().stop.is_empty());
