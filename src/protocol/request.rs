@@ -416,7 +416,7 @@ impl ChatRequest {
                     s.as_str(),
                     "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
                 ) {
-                    Some(s.into())
+                    Some(s)
                 } else {
                     note_ignored("request", "reasoning_effort");
                     None

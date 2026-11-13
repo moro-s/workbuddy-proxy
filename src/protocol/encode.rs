@@ -627,12 +627,8 @@ fn schema(value: &Value, protocol: UpstreamProtocol, path: &str) -> Result<(), E
             | "writeOnly" | "nullable" | "pattern" | "minimum" | "maximum" | "exclusiveMinimum"
             | "exclusiveMaximum" | "multipleOf" | "minLength" | "maxLength" | "minItems"
             | "maxItems" | "uniqueItems" | "minProperties" | "maxProperties" | "$comment"
-                if protocol == UpstreamProtocol::OpenaiResponses =>
-            {
-                ()
-            }
+                if protocol == UpstreamProtocol::OpenaiResponses => {}
             "$schema" | "$id" if v.is_string() && protocol == UpstreamProtocol::OpenaiResponses => {
-                ()
             }
             "allOf" | "oneOf" if protocol == UpstreamProtocol::OpenaiResponses => {
                 let values = v
