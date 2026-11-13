@@ -389,7 +389,9 @@ def main():
                         assert SECRET.encode() not in raw and KEY.encode() not in raw
                     before = server.seen_posts
                     status, raw, _ = error_request(port, 'wbp-native-%s' % i, base, extra={'seed': 0})
-                    assert status == 400 and json.loads(raw)['error']['code'] == 'unsupported_parameter'
+                    # A field the native protocols cannot express is dropped, not
+                    # rejected: the turn must still reach the model.
+                    assert status == 200 and SECRET.encode() not in raw and KEY.encode() not in raw
                     status, raw, _ = error_request(port, 'wbp-native-%s' % i, base, query='?unsupported=1')
                     assert status == 400 and json.loads(raw)['error']['code'] == 'unsupported_query'
                     expired = [{'role': 'user', 'content': 'hello'}, {'role': 'assistant', 'content': None, 'tool_calls': [
