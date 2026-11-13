@@ -9,7 +9,10 @@ use std::{
 };
 
 pub const INPUT_LIMIT: usize = 8 * 1024 * 1024;
-pub const TOOL_ARGUMENT_LIMIT: usize = 256 * 1024;
+/// Arguments replayed from history are model output, not client input: a single
+/// write_file/patch call easily carries hundreds of kilobytes. The old 256 KiB
+/// bound rejected such a transcript on the next turn.
+pub const TOOL_ARGUMENT_LIMIT: usize = 2 * 1024 * 1024;
 pub const TOOL_LIMIT: usize = 64;
 
 struct Checked {
@@ -18,7 +21,7 @@ struct Checked {
 impl<'de> DeserializeSeed<'de> for Checked {
     type Value = Value;
     fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
-        if self.depth > 64 {
+        if self.depth > 128 {
             return Err(de::Error::custom("JSON nesting limit exceeded"));
         }
         d.deserialize_any(self)
@@ -309,72 +312,116 @@ impl ChatRequest {
                     .ok_or_else(|| Error::input("invalid_parameter", "tools"))?;
                 rows.iter()
                     .enumerate()
+                    // Tool kinds the native protocols cannot express (custom,
+                    // web_search, local_shell, ...) are dropped instead of
+                    // failing the turn: the model simply cannot call them,
+                    // which is better than losing the whole exchange.
+                    .filter(|(i, v)| {
+                        let expressible = v
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .is_none_or(|t| t == "function");
+                        if !expressible {
+                            note_ignored(&format!("tools[{i}]"), "type");
+                        }
+                        expressible
+                    })
                     .map(|(i, v)| parse_tool(v, i))
                     .collect::<Result<Vec<_>, _>>()?
             }
         };
         let mut names = BTreeSet::new();
-        if tools.iter().any(|tool| !names.insert(&tool.name)) {
-            return Err(Error::input("duplicate_tool_name", "tools"));
-        }
+        // A repeated tool name is a client-side slip; keep the first definition
+        // rather than rejecting a turn the model could have served.
+        let tools: Vec<Tool> = tools
+            .into_iter()
+            .filter(|tool| {
+                let fresh = names.insert(tool.name.clone());
+                if !fresh {
+                    note_ignored("tools", "duplicate_name");
+                }
+                fresh
+            })
+            .collect();
         let tool_choice = match m.get("tool_choice") {
             None => ToolChoice::Auto,
             Some(Value::String(v)) => match v.as_str() {
                 "auto" => ToolChoice::Auto,
                 "none" => ToolChoice::None,
                 "required" => ToolChoice::Required,
-                _ => return Err(Error::input("invalid_parameter", "tool_choice")),
+                // Unknown string forms degrade to auto.
+                _ => {
+                    note_ignored("tool_choice", v);
+                    ToolChoice::Auto
+                }
             },
             Some(v) => {
                 let v = object(v, "tool_choice")?;
                 keys(v, &["type", "function"], "tool_choice")?;
                 if string(v.get("type"), "tool_choice.type")? != "function" {
-                    return Err(Error::input("unsupported_parameter", "tool_choice.type"));
+                    // "custom", "allowed_tools" and future kinds have no
+                    // upstream equivalent; let the model choose.
+                    note_ignored("tool_choice", "type");
+                    ToolChoice::Auto
+                } else {
+                    let f = object(
+                        v.get("function").unwrap_or(&Value::Null),
+                        "tool_choice.function",
+                    )?;
+                    keys(f, &["name"], "tool_choice.function")?;
+                    let tool = string(f.get("name"), "tool_choice.function.name")?;
+                    if tools.iter().any(|t| t.name == tool) {
+                        ToolChoice::Named(tool.into())
+                    } else {
+                        // The named tool may have been dropped above for being
+                        // inexpressible upstream; auto is the safe fallback.
+                        note_ignored("tool_choice.function", "name");
+                        ToolChoice::Auto
+                    }
                 }
-                let f = object(
-                    v.get("function").unwrap_or(&Value::Null),
-                    "tool_choice.function",
-                )?;
-                keys(f, &["name"], "tool_choice.function")?;
-                let tool = string(f.get("name"), "tool_choice.function.name")?;
-                if !names.contains(&tool.to_owned()) {
-                    return Err(Error::input("unknown_tool", "tool_choice.function.name"));
-                }
-                ToolChoice::Named(tool.into())
             }
         };
         if tools.is_empty() && matches!(tool_choice, ToolChoice::Required | ToolChoice::Named(_)) {
             return Err(Error::input("missing_tools", "tool_choice"));
         }
+        // Stop sequences have no representation on the Responses protocol - they
+        // are already dropped at encode time - so a long or malformed list must
+        // not fail a turn nothing downstream would have honoured anyway.
         let stop = match m.get("stop") {
             None => vec![],
             Some(Value::String(v)) if !v.is_empty() => vec![v.clone()],
-            Some(Value::Array(v)) if !v.is_empty() && v.len() <= 4 => v
+            Some(Value::Array(v)) => v
                 .iter()
-                .map(|v| {
-                    v.as_str()
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .ok_or_else(|| Error::input("invalid_parameter", "stop"))
-                })
-                .collect::<Result<_, _>>()?,
-            _ => return Err(Error::input("invalid_parameter", "stop")),
+                .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(String::from))
+                .take(4)
+                .collect(),
+            Some(_) => {
+                note_ignored("request", "stop");
+                vec![]
+            }
         };
+        // An effort level the translator does not recognise is dropped rather
+        // than rejected: the turn is still fully representable without it.
         let reasoning_effort = m
             .get("reasoning_effort")
-            .map(|v| {
-                string(Some(v), "reasoning_effort").and_then(|s| {
-                    if matches!(
-                        s,
-                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-                    ) {
-                        Ok(s.into())
-                    } else {
-                        Err(Error::input("unsupported_parameter", "reasoning_effort"))
-                    }
-                })
+            .and_then(|v| match v {
+                Value::String(s) if !s.is_empty() => Some(s.clone()),
+                _ => {
+                    note_ignored("request", "reasoning_effort");
+                    None
+                }
             })
-            .transpose()?;
+            .and_then(|s: String| {
+                if matches!(
+                    s.as_str(),
+                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                ) {
+                    Some(s.into())
+                } else {
+                    note_ignored("request", "reasoning_effort");
+                    None
+                }
+            });
         let response_format = m
             .get("response_format")
             .map(|v| {
@@ -506,9 +553,15 @@ fn parse_message(v: &Value, i: usize) -> Result<Message, Error> {
                             .map(|v| string(Some(v), &path))
                             .transpose()?
                             .unwrap_or("auto");
-                        if !matches!(detail, "auto" | "low" | "high") {
-                            return Err(Error::input("unsupported_image_detail", path));
-                        }
+                        // Detail is a hint; an unrecognised value ("original",
+                        // "high_res", ...) falls back to auto instead of
+                        // invalidating the whole message.
+                        let detail = if matches!(detail, "auto" | "low" | "high") {
+                            detail
+                        } else {
+                            note_ignored(&path, "image_url.detail");
+                            "auto"
+                        };
                         parts.push(parse_image(
                             string(image.get("url"), &path)?,
                             detail,
@@ -712,8 +765,12 @@ mod tests {
         ] {
             assert!(strict_json(bytes, INPUT_LIMIT).is_err());
         }
-        let deep = format!("{}0{}", "[".repeat(65), "]".repeat(65));
+        // The nesting bound still exists, it just sits above anything a real
+        // client emits rather than below a deep tool schema.
+        let deep = format!("{}0{}", "[".repeat(200), "]".repeat(200));
         assert!(strict_json(deep.as_bytes(), INPUT_LIMIT).is_err());
+        let shallow = format!("{}0{}", "[".repeat(100), "]".repeat(100));
+        assert!(strict_json(shallow.as_bytes(), INPUT_LIMIT).is_ok());
         assert!(strict_json(b"{}", 1).is_err());
     }
     #[test]
@@ -820,7 +877,67 @@ mod tests {
                 .is_err()
         );
         assert!(parse(json!({"tool_choice":"required"})).is_err());
-        assert!(parse(json!({"tools":[{"type":"function","function":{"name":"f"}}],"tool_choice":{"type":"function","function":{"name":"unknown"}}})).is_err());
+        // Naming a tool that is not defined degrades to auto: the definition may
+        // simply have been dropped as inexpressible upstream.
+        let degraded = parse(json!({"tools":[{"type":"function","function":{"name":"f"}}],"tool_choice":{"type":"function","function":{"name":"unknown"}}})).unwrap();
+        assert!(matches!(degraded.tool_choice, ToolChoice::Auto));
+    }
+    #[test]
+    fn inexpressible_optional_fields_degrade_instead_of_failing() {
+        // Tool kinds the native protocols cannot express are dropped, and the
+        // rest of the turn still goes through.
+        let r = parse(json!({"tools":[
+            {"type":"function","function":{"name":"f","parameters":{"type":"object"}}},
+            {"type":"custom","custom":{"name":"g"}}
+        ]}))
+        .unwrap();
+        assert_eq!(r.tools.len(), 1);
+        assert_eq!(r.tools[0].name, "f");
+
+        // A repeated tool name keeps the first definition.
+        let r = parse(json!({"tools":[
+            {"type":"function","function":{"name":"f","parameters":{"type":"object"}}},
+            {"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{}}}}
+        ]}))
+        .unwrap();
+        assert_eq!(r.tools.len(), 1);
+
+        // Stop lists are truncated, and unusable forms become empty.
+        assert_eq!(
+            parse(json!({"stop":["a","b","c","d","e"]})).unwrap().stop.len(),
+            4
+        );
+        assert!(parse(json!({"stop":42})).unwrap().stop.is_empty());
+
+        // Unrecognised effort levels are dropped.
+        assert!(
+            parse(json!({"reasoning_effort":"turbo"}))
+                .unwrap()
+                .reasoning_effort
+                .is_none()
+        );
+
+        // Unknown image detail falls back to auto.
+        assert!(
+            parse(json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","detail":"original"}}]}]}))
+                .is_ok()
+        );
+
+        // Unknown tool_choice forms fall back to auto.
+        assert!(
+            parse(json!({"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"tool_choice":{"type":"custom"}}))
+                .is_ok()
+        );
+
+        // Replayed arguments are model output: a large one must not fail the turn.
+        let arguments = json!({"data": "x".repeat(400_000)}).to_string();
+        assert!(
+            parse(json!({"messages":[
+                {"role":"assistant","content":null,"tool_calls":[{"id":"a","type":"function","function":{"name":"f","arguments":arguments}}]},
+                {"role":"tool","tool_call_id":"a","content":"x"}
+            ]}))
+            .is_ok()
+        );
     }
     #[test]
     fn image_encoding_is_validated_without_fetching_or_decoding() {

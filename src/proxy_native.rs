@@ -241,7 +241,38 @@ fn reject(guard: &mut Guard, e: &Error, kind: ErrorKind) {
         );
     }
 }
+/// Records rejected requests so a client-visible failure can be traced back to
+/// the exact validation that produced it. The response body carries only a
+/// generic message plus a structural path, which is not enough to identify the
+/// offending field once the path points at an array element.
+fn note_rejection(e: &Error) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let line = format!(
+        "status={} code={} param={}\n",
+        e.status,
+        e.code,
+        e.param.as_deref().unwrap_or("-")
+    );
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return;
+    };
+    if !seen.insert(line.clone()) {
+        return;
+    }
+    let file = std::env::temp_dir().join("workbuddy-proxy-rejections.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
 fn failure(e: Error, headers: HeaderMap) -> Response<Body> {
+    note_rejection(&e);
     let mut response = Response::builder()
         .status(StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY))
         .body(Body::from(e.envelope().to_string()))
