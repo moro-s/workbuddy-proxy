@@ -69,7 +69,8 @@ jobs:
           name: workbuddy-proxy-windows-x64
           path: |
             dist/*windows-x64.zip
-            dist/*windows-x64.zip.sha256
+            # package.py writes the ZIP checksum as <name>.sha256, not <name>.zip.sha256.
+            dist/*windows-x64.sha256
             dist/*windows-x64-setup.exe
             dist/*setup.exe.sha256
             installer-report.json
