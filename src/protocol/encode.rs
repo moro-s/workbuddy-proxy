@@ -89,9 +89,8 @@ fn responses(
     r: &ChatRequest,
     history: &ResolvedHistory,
 ) -> Result<Value, Error> {
-    if !r.stop.is_empty() {
-        return Err(Error::input("unsupported_parameter", "stop"));
-    }
+    // Responses has no stop-sequence concept. Dropping it is harmless; the
+    // model simply keeps generating until max_output_tokens.
     let mut input = Vec::new();
     let mut calls: BTreeMap<String, NativeCall> = BTreeMap::new();
     for (i, m) in r.messages.iter().enumerate() {
@@ -138,23 +137,21 @@ fn responses(
             .get(effort)
             .map(String::as_str)
             .unwrap_or(effort);
-        if native == "max" {
-            return Err(Error::input(
-                "unsupported_reasoning_effort",
-                "reasoning_effort",
-            ));
-        }
+        // Responses has no "max" tier; clamp instead of rejecting the turn.
+        let native = if native == "max" { "xhigh" } else { native };
         out["reasoning"] = json!({"effort":native});
     }
     if !r.tools.is_empty() {
         let mut tools = vec![];
         for tool in &r.tools {
+            let mut parameters = tool.parameters.clone();
+            strip_schema_keywords(&mut parameters);
             schema(
-                &tool.parameters,
+                &parameters,
                 UpstreamProtocol::OpenaiResponses,
                 "tools.function.parameters",
             )?;
-            let mut value = json!({"type":"function","name":tool.name,"parameters":tool.parameters,"strict":tool.strict.unwrap_or(false)});
+            let mut value = json!({"type":"function","name":tool.name,"parameters":parameters,"strict":tool.strict.unwrap_or(false)});
             if let Some(description) = &tool.description {
                 value["description"] = json!(description);
             }
@@ -175,6 +172,9 @@ fn responses(
         let mapped = match format["type"].as_str().expect("validated response format") {
             "json_schema" => {
                 let mut value = format["json_schema"].clone();
+                if let Some(schema_value) = value.get_mut("schema") {
+                    strip_schema_keywords(schema_value);
+                }
                 schema(
                     &value["schema"],
                     UpstreamProtocol::OpenaiResponses,
@@ -593,6 +593,23 @@ fn thinking(
     Ok(())
 }
 
+/// `$schema` and `$id` are document-level headers. Upstream APIs accept the
+/// schema body but not these keywords, so they are removed from a clone before
+/// encoding instead of failing the whole turn.
+fn strip_schema_keywords(value: &mut Value) {
+    match value {
+        Value::Object(m) => {
+            m.remove("$schema");
+            m.remove("$id");
+            for child in m.values_mut() {
+                strip_schema_keywords(child);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_schema_keywords),
+        _ => {}
+    }
+}
+
 /// A deliberately explicit schema subset. Unsupported constraints fail before
 /// transport rather than disappearing during vendor schema conversion.
 fn schema(value: &Value, protocol: UpstreamProtocol, path: &str) -> Result<(), Error> {
@@ -602,6 +619,26 @@ fn schema(value: &Value, protocol: UpstreamProtocol, path: &str) -> Result<(), E
     for (key, v) in m {
         match key.as_str() {
             "type" | "description" | "title" | "enum" | "required" => (),
+            "format" | "default" | "examples" | "const" | "deprecated" | "readOnly"
+            | "writeOnly" | "nullable" | "pattern" | "minimum" | "maximum"
+            | "exclusiveMinimum" | "exclusiveMaximum" | "multipleOf" | "minLength"
+            | "maxLength" | "minItems" | "maxItems" | "uniqueItems" | "minProperties"
+            | "maxProperties" | "$comment"
+                if protocol == UpstreamProtocol::OpenaiResponses => (),
+            "$schema" | "$id"
+                if v.is_string() && protocol == UpstreamProtocol::OpenaiResponses => (),
+            "allOf" | "oneOf"
+                if protocol == UpstreamProtocol::OpenaiResponses =>
+            {
+                let values = v
+                    .as_array()
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| Error::input("invalid_json_schema", path))?;
+                for child in values {
+                    schema(child, protocol, path)?;
+                }
+            }
+            "not" if protocol == UpstreamProtocol::OpenaiResponses => schema(v, protocol, path)?,
             "properties" | "$defs" => {
                 if key == "$defs" && protocol != UpstreamProtocol::OpenaiResponses {
                     return Err(Error::input("unsupported_json_schema", path));
@@ -745,7 +782,10 @@ mod tests {
         let mut s = ProtocolSettings::default();
         let h = ResolvedHistory::new();
         let r = request(json!({"reasoning_effort":"max"}));
-        assert!(encode(UpstreamProtocol::OpenaiResponses, "real", &s, &r, &h).is_err());
+        assert_eq!(
+            encode(UpstreamProtocol::OpenaiResponses, "real", &s, &r, &h).unwrap()["reasoning"]["effort"],
+            "xhigh"
+        );
         s.responses_efforts.insert("max".into(), "xhigh".into());
         assert_eq!(
             encode(UpstreamProtocol::OpenaiResponses, "real", &s, &r, &h).unwrap()["reasoning"]["effort"],

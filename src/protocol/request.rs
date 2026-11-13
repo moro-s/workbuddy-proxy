@@ -178,6 +178,39 @@ fn keys(m: &Map<String, Value>, allowed: &[&str], path: &str) -> Result<(), Erro
     }
     Ok(())
 }
+
+/// OpenAI-compatible clients routinely attach fields that the native upstream
+/// protocols have no representation for. These are dropped instead of failing
+/// the request: a harmless extra key must not break an otherwise valid turn.
+const IGNORED_REQUEST_KEYS: &[&str] = &[
+    "n",
+    "store",
+    "metadata",
+    "user",
+    "seed",
+    "logprobs",
+    "top_logprobs",
+    "frequency_penalty",
+    "presence_penalty",
+    "service_tier",
+    "prediction",
+    "modalities",
+    "audio",
+    "verbosity",
+    "safety_identifier",
+    "prompt_cache_key",
+    "web_search_options",
+    "reasoning",
+];
+
+fn keys_may_ignore(m: &Map<String, Value>, allowed: &[&str], path: &str) -> Result<(), Error> {
+    if m.keys().any(|k| {
+        !allowed.contains(&k.as_str()) && !IGNORED_REQUEST_KEYS.contains(&k.as_str())
+    }) {
+        return Err(Error::input("unsupported_parameter", path));
+    }
+    Ok(())
+}
 fn string<'a>(v: Option<&'a Value>, path: &str) -> Result<&'a str, Error> {
     v.and_then(Value::as_str)
         .ok_or_else(|| Error::input("invalid_parameter", path))
@@ -220,7 +253,7 @@ impl ChatRequest {
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let value = strict_json(bytes, INPUT_LIMIT)?;
         let m = object(&value, "request")?;
-        keys(
+        keys_may_ignore(
             m,
             &[
                 "model",
@@ -244,14 +277,8 @@ impl ChatRequest {
         if string(m.get("model"), "model")?.trim().is_empty() {
             return Err(Error::input("invalid_parameter", "model"));
         }
-        if m.get("n").is_some_and(|v| v.as_u64() != Some(1)) {
-            return Err(Error::input("unsupported_parameter", "n"));
-        }
         let stream = optional_bool(m, "stream", "stream")?.unwrap_or(false);
-        let include_usage = if let Some(options) = m.get("stream_options") {
-            if !stream {
-                return Err(Error::input("unsupported_parameter", "stream_options"));
-            }
+        let include_usage = if let Some(options) = m.get("stream_options").filter(|_| stream) {
             let options = object(options, "stream_options")?;
             keys(options, &["include_usage"], "stream_options")?;
             optional_bool(options, "include_usage", "stream_options.include_usage")?
@@ -450,7 +477,11 @@ fn parse_tool(v: &Value, i: usize) -> Result<Tool, Error> {
 fn parse_message(v: &Value, i: usize) -> Result<Message, Error> {
     let path = format!("messages[{i}]");
     let m = object(v, &path)?;
-    keys(m, &["role", "content", "tool_calls", "tool_call_id"], &path)?;
+    keys(
+        m,
+        &["role", "content", "tool_calls", "tool_call_id", "name"],
+        &path,
+    )?;
     let role = match string(m.get("role"), &format!("{path}.role"))? {
         "system" => Role::System,
         "developer" => Role::Developer,
@@ -462,7 +493,7 @@ fn parse_message(v: &Value, i: usize) -> Result<Message, Error> {
     let mut parts = Vec::new();
     match m.get("content") {
         Some(Value::String(s)) => parts.push(Part::Text(s.clone())),
-        Some(Value::Array(items)) if role != Role::Tool => {
+        Some(Value::Array(items)) => {
             for (j, item) in items.iter().enumerate() {
                 let path = format!("{path}.content[{j}]");
                 let m = object(item, &path)?;
@@ -700,16 +731,25 @@ mod tests {
         for extra in [
             json!({"stream":"true"}),
             json!({"stream":null}),
-            json!({"n":2}),
-            json!({"n":1.0}),
             json!({"max_tokens":0}),
             json!({"max_tokens":"1"}),
             json!({"max_tokens":1,"max_completion_tokens":2}),
-            json!({"stream_options":{"include_usage":true}}),
-            json!({"user":"secret"}),
-            json!({"seed":0}),
         ] {
             assert!(parse(extra.clone()).is_err(), "{extra}");
+        }
+        // Fields the native protocols cannot express are dropped, not rejected:
+        // a harmless extra key must not end the conversation.
+        for extra in [
+            json!({"n":2}),
+            json!({"n":1.0}),
+            json!({"user":"secret"}),
+            json!({"seed":0}),
+            json!({"store":false}),
+            json!({"metadata":{"k":"v"}}),
+            json!({"service_tier":"auto"}),
+            json!({"stream_options":{"include_usage":true}}),
+        ] {
+            assert!(parse(extra.clone()).is_ok(), "{extra}");
         }
         assert_eq!(
             parse(json!({"max_tokens":12,"max_completion_tokens":12}))
