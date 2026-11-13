@@ -1,0 +1,64 @@
+name: Package macOS arm64
+
+# Produces the distributable .dmg only. The full Desktop packages workflow
+# builds all three platforms and runs the whole suite, which is far more than
+# is needed to hand someone a Mac build.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dmg:
+    runs-on: macos-14
+    env:
+      WORKBUDDY_PROXY_CATALOG_TEST_URL: http://127.0.0.1:1/catalog
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            gpui -> target
+      - name: Resolve package version
+        shell: bash
+        run: echo "PACKAGE_VERSION=$(python scripts/release_version.py)" >> "$GITHUB_ENV"
+      - name: Build Core
+        run: cargo build --release --locked
+      - name: Build GPUI
+        run: cargo build --manifest-path gpui/Cargo.toml --release --locked
+      - name: Verify the Core is a native arm64 binary
+        shell: bash
+        run: |
+          file target/release/workbuddy-proxy
+          file target/release/workbuddy-proxy | grep -q 'arm64' || { echo '::error::Core is not arm64'; exit 1; }
+      - name: Smoke the Core
+        run: python scripts/smoke.py --exe target/release/workbuddy-proxy
+      - name: Install DMG build tools
+        run: python -m pip install -r scripts/dmg-requirements.txt
+      - name: Package the .app and .dmg
+        run: python scripts/package.py --exe target/release/workbuddy-proxy --gpui gpui/target/release/workbuddy-proxy-gpui --platform macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy-proxy-macos-arm64
+          path: |
+            dist/*.dmg
+            dist/*.dmg.sha256
+          if-no-files-found: error
+      - name: Summarize
+        shell: bash
+        run: |
+          {
+            echo "### workbuddy-proxy ${PACKAGE_VERSION} for macOS arm64"
+            echo
+            ls -lh dist/
+            echo
+            echo '```'
+            cat dist/*.dmg.sha256
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
